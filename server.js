@@ -19,6 +19,9 @@ function getCache(key) {
 }
 function setCache(key, data) { cache.set(key, { data, ts: Date.now() }); }
 
+// API Key usada APENAS para inscritos (1 unidade por canal — custo mínimo)
+const YT_API_KEY = 'AIzaSyD0S9SycdZ89eSIqVdZ6eoJ7i7gtieErQo';
+
 const HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
   'Accept-Language': 'pt-BR,pt;q=0.9',
@@ -90,31 +93,15 @@ async function scrapeChannel(channelId) {
     const handleM = html.match(/"canonicalChannelUrl":"https:\/\/www\.youtube\.com\/(@[^"]+)"/);
     if (handleM) result.handle = handleM[1];
 
-    // inscritos — YouTube frequentemente omite para bots
-    // tenta vários padrões incluindo o novo formato
-    const subsPatterns = [
-      /"subscriberCountText":\{"simpleText":"([^"]+)"/,
-      /"subscriberCountText":\{"runs":\[\{"text":"([^"]+)"/,
-      /"subscribers":\{"simpleText":"([^"]+)"/,
-      /"subscriberCount":"(\d+)"/,
-      /"metadataRowRenderer"[^}]+"simpleText":"([\d][^"]*(?:inscritos|subscribers)[^"]*)"/,
-    ];
-    for (const p of subsPatterns) {
-      const m = html.match(p);
-      if (m) { result.subs = parseSubs(m[1]); break; }
-    }
-
-    // fallback: "6,5 mi de inscritos" no texto bruto
-    if (!result.subs) {
-      const fbM = html.match(/(\d[\d\.,]* (?:mi|mil|bi|k|m) de inscritos)/i);
-      if (fbM) result.subs = parseSubs(fbM[1]);
-    }
-
-    // fallback 2: aboutPageRenderer subscriberCount
-    if (!result.subs) {
-      const aboutM = html.match(/"aboutPageRenderer"[\s\S]{0,500}"subscriberCountText":\{"simpleText":"([^"]+)"/);
-      if (aboutM) result.subs = parseSubs(aboutM[1]);
-    }
+    // inscritos via API (1 unidade — custo mínimo, sem problema de bot)
+    try {
+      const apiUrl = `https://www.googleapis.com/youtube/v3/channels?part=statistics&id=${channelId}&key=${YT_API_KEY}`;
+      const apiRes = await fetch(apiUrl);
+      const apiJson = await apiRes.json();
+      if (!apiJson.error && apiJson.items?.length > 0) {
+        result.subs = parseInt(apiJson.items[0].statistics.subscriberCount || 0);
+      }
+    } catch {}
 
   } catch(e) { result.error_stats = e.message; }
 
