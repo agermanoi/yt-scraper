@@ -17,37 +17,63 @@ function getCache(key) {
   if (Date.now() - e.ts > CACHE_TTL) { cache.delete(key); return null; }
   return e.data;
 }
-function setCache(key, data) {
-  cache.set(key, { data, ts: Date.now() });
-}
+function setCache(key, data) { cache.set(key, { data, ts: Date.now() }); }
 
 const HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
   'Accept-Language': 'pt-BR,pt;q=0.9',
   'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-  'Accept-Encoding': 'gzip, deflate, br',
 };
 
-// Extrai todos os matches de um padrão no JSON
-function extractAll(str, pattern) {
-  const results = [];
-  let m;
-  const re = new RegExp(pattern, 'g');
-  while ((m = re.exec(str)) !== null) results.push(m[1]);
-  return results;
+function parseSubs(text) {
+  if (!text) return null;
+  if (typeof text === 'number') return text;
+  const t = text.toLowerCase().replace(/\s+/g,'').replace(',','.');
+  if (t.includes('bi'))  return Math.round(parseFloat(t) * 1e9);
+  if (t.includes('mi'))  return Math.round(parseFloat(t) * 1e6);
+  if (t.includes('mil')) return Math.round(parseFloat(t) * 1e3);
+  if (t.includes('m') && !t.includes('max')) return Math.round(parseFloat(t) * 1e6);
+  if (t.includes('k'))   return Math.round(parseFloat(t) * 1e3);
+  const n = parseInt(t.replace(/\D/g,''));
+  return n || null;
+}
+
+// Extrai ytInitialData de um HTML
+function extractYtData(html) {
+  // tenta vários padrões pois o YouTube muda o formato
+  const patterns = [
+    /var ytInitialData\s*=\s*({.+?});\s*<\/script>/s,
+    /var ytInitialData\s*=\s*({.+?});\s*var /s,
+    /ytInitialData\s*=\s*({.+?});\s*(?:\/\/|<)/s,
+  ];
+  for (const p of patterns) {
+    const m = html.match(p);
+    if (m) { try { return JSON.parse(m[1]); } catch {} }
+  }
+  return null;
+}
+
+function extractPlayerResponse(html) {
+  const patterns = [
+    /var ytInitialPlayerResponse\s*=\s*({.+?});\s*<\/script>/s,
+    /var ytInitialPlayerResponse\s*=\s*({.+?});\s*var /s,
+    /ytInitialPlayerResponse\s*=\s*({.+?});\s*(?:\/\/|<)/s,
+  ];
+  for (const p of patterns) {
+    const m = html.match(p);
+    if (m) { try { return JSON.parse(m[1]); } catch {} }
+  }
+  return null;
 }
 
 async function scrapeChannel(channelId) {
-  const cached = getCache(channelId);
-  if (cached) return { ...cached, fromCache: true };
-
   const result = {
     live: false, viewers: null, videoId: null,
     title: null, thumb: null, name: null,
     handle: null, subs: null, avatar: null,
   };
 
-  // ── 1. Scrape página principal do canal (para nome, inscritos, avatar) ──
+  // ── 1. Página principal — nome, inscritos, avatar ──
   try {
     const r   = await fetch(`https://www.youtube.com/channel/${channelId}`, { headers: HEADERS });
     const html = await r.text();
@@ -56,102 +82,116 @@ async function scrapeChannel(channelId) {
     const nameM = html.match(/"channelMetadataRenderer":\{"title":"([^"]+)"/);
     if (nameM) result.name = nameM[1];
 
-    // handle (@nome)
-    const handleM = html.match(/"canonicalChannelUrl":"https:\/\/www\.youtube\.com\/(@[^"]+)"/);
-    if (handleM) result.handle = handleM[1];
-
-    // avatar — pega a maior thumbnail disponível
+    // avatar
     const avatarM = html.match(/"avatar":\{"thumbnails":\[\{"url":"(https:\/\/yt3[^"]+)"/);
     if (avatarM) result.avatar = avatarM[1].replace(/=s\d+/, '=s88');
 
-    // inscritos — tenta vários padrões
+    // handle
+    const handleM = html.match(/"canonicalChannelUrl":"https:\/\/www\.youtube\.com\/(@[^"]+)"/);
+    if (handleM) result.handle = handleM[1];
+
+    // inscritos — múltiplos padrões
     const subsPatterns = [
       /"subscriberCountText":\{"simpleText":"([^"]+)"/,
-      /"subscriberCountText":\{"accessibility":\{"accessibilityData":\{"label":"([^"]+)"/,
-      /"metadataRowRenderer":\{"title":\{"simpleText":"Inscritos"\},"contents":\[\{"simpleText":"([^"]+)"/,
+      /"subscriberCountText":\{"runs":\[\{"text":"([^"]+)"/,
       /"subscribers":\{"simpleText":"([^"]+)"/,
+      /"metadataRowRenderer".*?"simpleText":"([0-9][^"]*(?:inscritos|subscribers)[^"]*)"/s,
     ];
-    for (const pat of subsPatterns) {
-      const m = html.match(pat);
-      if (m) { result.subs = m[1]; break; }
+    for (const p of subsPatterns) {
+      const m = html.match(p);
+      if (m) { result.subs = parseSubs(m[1]); break; }
     }
 
-    // fallback inscritos: busca "X de inscritos" ou "X subscribers"
+    // fallback: busca número seguido de "de inscritos" no texto
     if (!result.subs) {
-      const fbM = html.match(/"([0-9][0-9\.,]* (?:mi|mil|bi|M|K)?(?: de)? ?(?:inscritos|subscribers))"/i);
-      if (fbM) result.subs = fbM[1];
+      const fbM = html.match(/"([\d\.,]+ (?:mi|mil|bi|M|K)? ?de inscritos)"/i);
+      if (fbM) result.subs = parseSubs(fbM[1]);
     }
-  } catch(e) {
-    result.error_stats = e.message;
-  }
 
-  // ── 2. Scrape página /live do canal ──
+  } catch(e) { result.error_stats = e.message; }
+
+  // ── 2. Página /live — detecta live, videoId, viewers ──
   try {
     const r    = await fetch(`https://www.youtube.com/channel/${channelId}/live`, { headers: HEADERS });
     const html = await r.text();
+    const finalUrl = r.url;
 
-    // Verifica se é realmente uma live — página de live redireciona para /watch?v=
-    const isLivePage = r.url.includes('/watch?v=') || html.includes('"isLiveNow":true') || html.includes('"isLive":true');
-
-    // videoId — pega o primeiro da URL redirecionada se houver
-    if (r.url.includes('/watch?v=')) {
-      const urlVid = r.url.match(/watch\?v=([a-zA-Z0-9_-]{11})/);
+    // Se redirecionou para /watch?v= → tem live
+    if (finalUrl.includes('/watch?v=')) {
+      result.live = true;
+      const urlVid = finalUrl.match(/watch\?v=([a-zA-Z0-9_-]{11})/);
       if (urlVid) result.videoId = urlVid[1];
     }
 
-    // videoId do HTML
-    if (!result.videoId) {
-      // busca videoId dentro de "currentVideoEndpoint"
-      const cvM = html.match(/"currentVideoEndpoint":\{"clickTrackingParams":"[^"]*","commandMetadata":[^}]+\},"watchEndpoint":\{"videoId":"([a-zA-Z0-9_-]{11})"/);
-      if (cvM) result.videoId = cvM[1];
-    }
-
-    // concurrent viewers
-    const viewPatterns = [
-      /"concurrentViewers":"(\d+)"/,
-      /"viewCount":"(\d+)"/,
-    ];
-    for (const pat of viewPatterns) {
-      const m = html.match(pat);
-      if (m && parseInt(m[1]) > 0) {
-        result.viewers = parseInt(m[1]);
+    // playerResponse tem os dados mais confiáveis de live
+    const player = extractPlayerResponse(html);
+    if (player) {
+      const vd = player?.videoDetails;
+      if (vd?.isLive || vd?.isLiveContent) {
         result.live    = true;
-        break;
+        result.videoId = result.videoId || vd?.videoId || null;
+        result.title   = vd?.title || null;
+
+        // viewers no videoDetails
+        if (vd?.viewCount && parseInt(vd.viewCount) > 0) {
+          result.viewers = parseInt(vd.viewCount);
+        }
+      }
+      // liveStreamingDetails
+      const lsd = player?.microformat?.playerMicroformatRenderer?.liveBroadcastDetails;
+      if (lsd?.isLiveNow) {
+        result.live    = true;
+        result.videoId = result.videoId || player?.microformat?.playerMicroformatRenderer?.externalVideoId || null;
       }
     }
 
-    // "N assistindo agora"
-    if (!result.viewers) {
-      const ptM = html.match(/"([0-9][0-9\.,]*(?:\s*(?:mil|mi|k))?)(?:\s+(?:assistindo agora|watching now))"/i);
-      if (ptM) {
-        result.viewers = parseSubs(ptM[1]);
+    // ytInitialData — concurrent viewers
+    const ytData = extractYtData(html);
+    if (ytData) {
+      const str = JSON.stringify(ytData);
+
+      // concurrent viewers
+      const cvM = str.match(/"concurrentViewers":"(\d+)"/);
+      if (cvM) { result.viewers = parseInt(cvM[1]); result.live = true; }
+
+      // "N assistindo agora"
+      const watchM = str.match(/"([\d\.,]+(?:\s*(?:mil|mi|k))?)\s*(?:assistindo agora|watching now)"/i);
+      if (watchM && !result.viewers) {
+        result.viewers = parseSubs(watchM[1]);
         result.live    = true;
+      }
+
+      // badge live
+      if (!result.live && (str.includes('"BADGE_STYLE_TYPE_LIVE_NOW"') || str.includes('"style":"LIVE"'))) {
+        result.live = true;
+      }
+
+      // videoId via currentVideoEndpoint
+      if (!result.videoId) {
+        const vidM = str.match(/"currentVideoEndpoint":[^}]+?"videoId":"([a-zA-Z0-9_-]{11})"/);
+        if (vidM) result.videoId = vidM[1];
+      }
+
+      // título
+      if (!result.title && result.live) {
+        const titleM = str.match(/"videoPrimaryInfoRenderer":\{"title":\{"runs":\[\{"text":"([^"]+)"/);
+        if (titleM) result.title = titleM[1];
       }
     }
 
-    // badge de live
+    // último fallback — raw HTML
     if (!result.live) {
-      result.live = html.includes('"BADGE_STYLE_TYPE_LIVE_NOW"')
-        || html.includes('"isLiveNow":true')
-        || html.includes('"style":"LIVE"')
-        || isLivePage;
+      result.live = html.includes('"isLiveNow":true')
+        || html.includes('"isLive":true')
+        || html.includes('isLiveContent":true');
     }
 
-    // título da live
-    if (result.live && !result.title) {
-      const titleM = html.match(/"videoDetails":\{"videoId":"[^"]+","title":"([^"]+)"/);
-      if (titleM) result.title = titleM[1];
+    if (!result.videoId && result.live) {
+      const vidM = html.match(/"videoId":"([a-zA-Z0-9_-]{11})"/);
+      if (vidM) result.videoId = vidM[1];
     }
 
-    // se videoId encontrado mas não tem certeza se é live, verifica pelo título
-    if (result.videoId && !result.live) {
-      const liveTitle = html.match(/"isLiveContent":true/);
-      if (liveTitle) result.live = true;
-    }
-
-  } catch(e) {
-    result.error_live = e.message;
-  }
+  } catch(e) { result.error_live = e.message; }
 
   if (result.videoId && result.live) {
     result.thumb = `https://i.ytimg.com/vi/${result.videoId}/maxresdefault_live.jpg`;
@@ -161,28 +201,23 @@ async function scrapeChannel(channelId) {
   return { ...result, fromCache: false };
 }
 
-function parseSubs(text) {
-  if (!text) return 0;
-  if (typeof text === 'number') return text;
-  const t = text.toLowerCase().replace(/\s+/g,'').replace(',','.');
-  if (t.includes('bi'))  return Math.round(parseFloat(t) * 1e9);
-  if (t.includes('mi'))  return Math.round(parseFloat(t) * 1e6);
-  if (t.includes('mil')) return Math.round(parseFloat(t) * 1e3);
-  if (t.includes('m'))   return Math.round(parseFloat(t) * 1e6);
-  if (t.includes('k'))   return Math.round(parseFloat(t) * 1e3);
-  return parseInt(t.replace(/\D/g,'')) || 0;
-}
-
-// ── ENDPOINTS ─────────────────────────────────────────
+// ── ENDPOINTS ──────────────────────────────────────────
 
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', service: 'yt-live-scraper', uptime: process.uptime() });
+  res.json({ status: 'ok', service: 'yt-live-scraper', uptime: Math.round(process.uptime()) });
 });
 
+// GET /live/:channelId?nocache=1
 app.get('/live/:channelId', async (req, res) => {
   const { channelId } = req.params;
   if (!channelId || !channelId.startsWith('UC'))
     return res.status(400).json({ error: 'Channel ID inválido' });
+
+  if (!req.query.nocache) {
+    const cached = getCache(channelId);
+    if (cached) return res.json({ channelId, ...cached, fromCache: true });
+  }
+
   try {
     res.json({ channelId, ...await scrapeChannel(channelId) });
   } catch(e) {
@@ -192,22 +227,25 @@ app.get('/live/:channelId', async (req, res) => {
 
 // POST /live/batch
 app.post('/live/batch', async (req, res) => {
-  const { channelIds } = req.body;
+  const { channelIds, nocache } = req.body;
   if (!Array.isArray(channelIds) || !channelIds.length)
     return res.status(400).json({ error: 'Envie um array channelIds' });
   if (channelIds.length > 20)
     return res.status(400).json({ error: 'Máximo 20 canais' });
 
   const results = {};
-  // processa 2 por vez para não ser bloqueado
   for (let i = 0; i < channelIds.length; i += 2) {
     const chunk = channelIds.slice(i, i + 2);
     await Promise.all(chunk.map(async id => {
+      if (!nocache) {
+        const cached = getCache(id);
+        if (cached) { results[id] = { ...cached, fromCache: true }; return; }
+      }
       try { results[id] = await scrapeChannel(id); }
       catch(e) { results[id] = { live: false, viewers: null, subs: null, error: e.message }; }
     }));
     if (i + 2 < channelIds.length)
-      await new Promise(r => setTimeout(r, 800));
+      await new Promise(r => setTimeout(r, 600));
   }
 
   res.json({ results, cachedAt: new Date().toISOString() });
