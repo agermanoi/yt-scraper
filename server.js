@@ -1,4 +1,3 @@
-// v4
 const express = require('express');
 const cors    = require('cors');
 const fetch   = require('node-fetch');
@@ -74,9 +73,9 @@ async function scrapeChannel(channelId) {
     handle: null, subs: null, avatar: null,
   };
 
-  // ── 1. Página principal — nome, inscritos, avatar ──
+  // ── 1. Página principal — nome, avatar, inscritos ──
   try {
-    const r   = await fetch(`https://www.youtube.com/channel/${channelId}`, { headers: HEADERS });
+    const r    = await fetch(`https://www.youtube.com/channel/${channelId}`, { headers: HEADERS });
     const html = await r.text();
 
     // nome
@@ -91,22 +90,30 @@ async function scrapeChannel(channelId) {
     const handleM = html.match(/"canonicalChannelUrl":"https:\/\/www\.youtube\.com\/(@[^"]+)"/);
     if (handleM) result.handle = handleM[1];
 
-    // inscritos — múltiplos padrões
+    // inscritos — YouTube frequentemente omite para bots
+    // tenta vários padrões incluindo o novo formato
     const subsPatterns = [
       /"subscriberCountText":\{"simpleText":"([^"]+)"/,
       /"subscriberCountText":\{"runs":\[\{"text":"([^"]+)"/,
       /"subscribers":\{"simpleText":"([^"]+)"/,
-      /"metadataRowRenderer".*?"simpleText":"([0-9][^"]*(?:inscritos|subscribers)[^"]*)"/s,
+      /"subscriberCount":"(\d+)"/,
+      /"metadataRowRenderer"[^}]+"simpleText":"([\d][^"]*(?:inscritos|subscribers)[^"]*)"/,
     ];
     for (const p of subsPatterns) {
       const m = html.match(p);
       if (m) { result.subs = parseSubs(m[1]); break; }
     }
 
-    // fallback: busca número seguido de "de inscritos" no texto
+    // fallback: "6,5 mi de inscritos" no texto bruto
     if (!result.subs) {
-      const fbM = html.match(/"([\d\.,]+ (?:mi|mil|bi|M|K)? ?de inscritos)"/i);
+      const fbM = html.match(/(\d[\d\.,]* (?:mi|mil|bi|k|m) de inscritos)/i);
       if (fbM) result.subs = parseSubs(fbM[1]);
+    }
+
+    // fallback 2: aboutPageRenderer subscriberCount
+    if (!result.subs) {
+      const aboutM = html.match(/"aboutPageRenderer"[\s\S]{0,500}"subscriberCountText":\{"simpleText":"([^"]+)"/);
+      if (aboutM) result.subs = parseSubs(aboutM[1]);
     }
 
   } catch(e) { result.error_stats = e.message; }
@@ -146,34 +153,41 @@ async function scrapeChannel(channelId) {
       }
     }
 
-    // ytInitialData — concurrent viewers
+    // extrai viewers e outros dados do HTML bruto
+    // padrão confirmado: "originalViewCount":"NNNN"
+    const origViewM = html.match(/"originalViewCount":"(\d+)"/);
+    if (origViewM && parseInt(origViewM[1]) > 0) {
+      result.viewers = parseInt(origViewM[1]);
+      result.live    = true;
+    }
+
+    // fallback concurrent viewers
+    if (!result.viewers) {
+      const cvM = html.match(/"concurrentViewers":"(\d+)"/);
+      if (cvM) { result.viewers = parseInt(cvM[1]); result.live = true; }
+    }
+
+    // "N assistindo agora"
+    if (!result.viewers) {
+      const watchM = html.match(/"([\d\.]+(?:mil|mi|k)?)\s*assistindo agora"/i);
+      if (watchM) { result.viewers = parseSubs(watchM[1]); result.live = true; }
+    }
+
+    // badge live
+    if (!result.live) {
+      result.live = html.includes('"BADGE_STYLE_TYPE_LIVE_NOW"')
+        || html.includes('"isLive":true')
+        || html.includes('"style":"LIVE"');
+    }
+
+    // ytInitialData para videoId e título
     const ytData = extractYtData(html);
     if (ytData) {
       const str = JSON.stringify(ytData);
-
-      // concurrent viewers
-      const cvM = str.match(/"concurrentViewers":"(\d+)"/);
-      if (cvM) { result.viewers = parseInt(cvM[1]); result.live = true; }
-
-      // "N assistindo agora"
-      const watchM = str.match(/"([\d\.,]+(?:\s*(?:mil|mi|k))?)\s*(?:assistindo agora|watching now)"/i);
-      if (watchM && !result.viewers) {
-        result.viewers = parseSubs(watchM[1]);
-        result.live    = true;
-      }
-
-      // badge live
-      if (!result.live && (str.includes('"BADGE_STYLE_TYPE_LIVE_NOW"') || str.includes('"style":"LIVE"'))) {
-        result.live = true;
-      }
-
-      // videoId via currentVideoEndpoint
       if (!result.videoId) {
         const vidM = str.match(/"currentVideoEndpoint":[^}]+?"videoId":"([a-zA-Z0-9_-]{11})"/);
         if (vidM) result.videoId = vidM[1];
       }
-
-      // título
       if (!result.title && result.live) {
         const titleM = str.match(/"videoPrimaryInfoRenderer":\{"title":\{"runs":\[\{"text":"([^"]+)"/);
         if (titleM) result.title = titleM[1];
