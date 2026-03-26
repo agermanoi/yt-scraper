@@ -251,4 +251,43 @@ app.post('/live/batch', async (req, res) => {
   res.json({ results, cachedAt: new Date().toISOString() });
 });
 
+
+// DEBUG — mostra trechos do HTML para diagnóstico
+app.get('/debug/:channelId', async (req, res) => {
+  const { channelId } = req.params;
+  try {
+    const r1   = await fetch(`https://www.youtube.com/channel/${channelId}`, { headers: HEADERS });
+    const h1   = await r1.text();
+    const r2   = await fetch(`https://www.youtube.com/channel/${channelId}/live`, { headers: HEADERS });
+    const h2   = await r2.text();
+
+    // Extrai trechos relevantes
+    const snap = (html, pattern, label) => {
+      const m = html.match(pattern);
+      return m ? { [label]: m[0].substring(0, 300) } : { [label]: null };
+    };
+
+    res.json({
+      channelPage: {
+        length: h1.length,
+        hasSubs: h1.includes('subscriberCount'),
+        subsSnippet: h1.match(/subscriber[^"]{0,80}/i)?.[0] || null,
+        subsText: h1.match(/"subscriberCountText":.{0,150}/)?.[0] || null,
+        subsAlt: h1.match(/[\d\.,]+ (?:mi|mil|k|m) de inscritos/i)?.[0] || null,
+      },
+      livePage: {
+        length: h2.length,
+        finalUrl: r2.url,
+        hasIsLive: h2.includes('isLive'),
+        hasConcurrent: h2.includes('concurrentViewers'),
+        concurrentSnippet: h2.match(/concurrentViewers.{0,100}/)?.[0] || null,
+        viewCountSnippet: h2.match(/"viewCount":"[^"]+"/)?.[0] || null,
+        watchingSnippet: h2.match(/assistindo agora.{0,50}/i)?.[0] || null,
+      }
+    });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.listen(PORT, () => console.log(`YT Live Scraper rodando na porta ${PORT}`));
