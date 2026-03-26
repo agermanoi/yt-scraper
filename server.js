@@ -195,27 +195,41 @@ async function scrapeChannel(channelId) {
   // ── 3. Busca lives adicionais na página /streams ──
   result.extraLives = [];
   try {
-    const r2   = await fetch(`https://www.youtube.com/channel/${channelId}/streams`, { headers: HEADERS });
+    const r2    = await fetch(`https://www.youtube.com/channel/${channelId}/streams`, { headers: HEADERS });
     const html2 = await r2.text();
     const ytData2 = extractYtData(html2);
     if (ytData2) {
+      // Navega pelos gridVideoRenderer / videoRenderer para achar só os que estão LIVE agora
       const str = JSON.stringify(ytData2);
-      // extrai todos os videoIds de lives ativas (badge LIVE_NOW)
-      const liveBlocks = str.match(/"BADGE_STYLE_TYPE_LIVE_NOW"[\s\S]{0,300}?"videoId":"([a-zA-Z0-9_-]{11})"/g) || [];
-      for (const block of liveBlocks) {
-        const vidM = block.match(/"videoId":"([a-zA-Z0-9_-]{11})"/);
-        const titleM = block.match(/"text":"([^"]{5,100})"/);
-        if (vidM && vidM[1] !== result.videoId) {
-          result.extraLives.push({
-            videoId: vidM[1],
-            title: titleM ? titleM[1] : null,
-            thumb: `https://i.ytimg.com/vi/${vidM[1]}/maxresdefault_live.jpg`,
-            ytLink: `https://www.youtube.com/watch?v=${vidM[1]}`,
-          });
-        }
+
+      // Cada vídeo ao vivo tem "thumbnailOverlays" com "LIVE" e um "videoId" próximo
+      // Estratégia: achar blocos que contenham SIMULTANEAMENTE "LIVE_NOW" E um viewCount ativo
+      // O padrão mais confiável: "isLive":true dentro do mesmo bloco de videoRenderer
+      
+      // Extrai todos os blocos de videoRenderer
+      const rendererMatches = str.match(/"videoRenderer":\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}/g) || [];
+      
+      for (const block of rendererMatches) {
+        // só processa se o bloco indica live ATIVA (não upcoming, não ended)
+        const isActiveLive = block.includes('"BADGE_STYLE_TYPE_LIVE_NOW"') ||
+                             (block.includes('"style":"LIVE"') && !block.includes('"isUpcoming"'));
+        if (!isActiveLive) continue;
+
+        const vidM   = block.match(/"videoId":"([a-zA-Z0-9_-]{11})"/);
+        const titleM = block.match(/"title":\{"runs":\[\{"text":"([^"]+)"/);
+        if (!vidM) continue;
+        const videoId = vidM[1];
+        if (videoId === result.videoId) continue; // já é a live principal
+
+        result.extraLives.push({
+          videoId,
+          title: titleM ? titleM[1] : null,
+          thumb: `https://i.ytimg.com/vi/${videoId}/maxresdefault_live.jpg`,
+          ytLink: `https://www.youtube.com/watch?v=${videoId}`,
+        });
       }
     }
-  } catch {}
+  } catch(e) { result.error_streams = e.message; }
 
   if (result.videoId && result.live) {
     result.thumb  = `https://i.ytimg.com/vi/${result.videoId}/maxresdefault_live.jpg`;
