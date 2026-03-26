@@ -19,9 +19,6 @@ function getCache(key) {
 }
 function setCache(key, data) { cache.set(key, { data, ts: Date.now() }); }
 
-// API Key usada APENAS para inscritos (1 unidade por canal — custo mínimo)
-const YT_API_KEY = 'AIzaSyD0S9SycdZ89eSIqVdZ6eoJ7i7gtieErQo';
-
 const HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
   'Accept-Language': 'pt-BR,pt;q=0.9',
@@ -93,32 +90,55 @@ async function scrapeChannel(channelId) {
     const handleM = html.match(/"canonicalChannelUrl":"https:\/\/www\.youtube\.com\/(@[^"]+)"/);
     if (handleM) result.handle = handleM[1];
 
-    // inscritos via API (1 unidade — custo mínimo, sem problema de bot)
-    try {
-      const apiUrl = `https://www.googleapis.com/youtube/v3/channels?part=statistics&id=${channelId}&key=${YT_API_KEY}`;
-      const apiRes = await fetch(apiUrl);
-      const apiJson = await apiRes.json();
-      if (!apiJson.error && apiJson.items?.length > 0) {
-        result.subs = parseInt(apiJson.items[0].statistics.subscriberCount || 0);
-      }
-    } catch {}
+    // inscritos via scraping — sem API, sem cota
+    // busca na página principal padrões conhecidos
+    const subsPatterns = [
+      /"subscriberCountText":\{"simpleText":"([^"]+)"/,
+      /"subscriberCountText":\{"runs":\[\{"text":"([^"]+)"/,
+      /"subscriberCount":"(\d+)"/,
+      /,"subscriberCount":"(\d+)","hiddenSubscriberCount"/,
+    ];
+    for (const p of subsPatterns) {
+      const m = html.match(p);
+      if (m && m[1]) { result.subs = parseSubs(m[1]); break; }
+    }
+
+    // fallback: scrape /about que tem inscritos visíveis
+    if (!result.subs) {
+      try {
+        const aboutR = await fetch(`https://www.youtube.com/channel/${channelId}/about`, { headers: HEADERS });
+        const aboutHtml = await aboutR.text();
+        for (const p of subsPatterns) {
+          const m = aboutHtml.match(p);
+          if (m && m[1]) { result.subs = parseSubs(m[1]); break; }
+        }
+        // padrão extra na página about
+        if (!result.subs) {
+          const aboutM = aboutHtml.match(/"(\d[\d\.\,]* (?:mi|mil|bi|k|m)?(?:\s*de)?\s*inscritos)"/i);
+          if (aboutM) result.subs = parseSubs(aboutM[1]);
+        }
+      } catch {}
+    }
 
   } catch(e) { result.error_stats = e.message; }
 
-  // ── 2. Página /live — detecta live, videoId, viewers ──
+  // ── 2. Busca TODAS as lives do canal via /search ──
   try {
+    const searchUrl = `https://www.youtube.com/channel/${channelId}/search?query=`;
+    // usa a página /videos?view=2 que lista conteúdo ao vivo
+    const liveSearchUrl = `https://www.youtube.com/channel/${channelId}/streams`;
     const r    = await fetch(`https://www.youtube.com/channel/${channelId}/live`, { headers: HEADERS });
     const html = await r.text();
     const finalUrl = r.url;
 
-    // Se redirecionou para /watch?v= → tem live
+    // videoId da URL redirecionada
     if (finalUrl.includes('/watch?v=')) {
       result.live = true;
       const urlVid = finalUrl.match(/watch\?v=([a-zA-Z0-9_-]{11})/);
       if (urlVid) result.videoId = urlVid[1];
     }
 
-    // playerResponse tem os dados mais confiáveis de live
+    // playerResponse
     const player = extractPlayerResponse(html);
     if (player) {
       const vd = player?.videoDetails;
@@ -126,83 +146,43 @@ async function scrapeChannel(channelId) {
         result.live    = true;
         result.videoId = result.videoId || vd?.videoId || null;
         result.title   = vd?.title || null;
-
-        // viewers no videoDetails
-        if (vd?.viewCount && parseInt(vd.viewCount) > 0) {
+        if (vd?.viewCount && parseInt(vd.viewCount) > 0)
           result.viewers = parseInt(vd.viewCount);
-        }
-      }
-      // liveStreamingDetails
-      const lsd = player?.microformat?.playerMicroformatRenderer?.liveBroadcastDetails;
-      if (lsd?.isLiveNow) {
-        result.live    = true;
-        result.videoId = result.videoId || player?.microformat?.playerMicroformatRenderer?.externalVideoId || null;
       }
     }
 
-    // ── viewers: busca no HTML bruto com múltiplos padrões ──
-    // O YouTube embute os dados em JSON escapado, então buscamos no texto bruto
-
-    // padrão 1: "originalViewCount":"3985" (confirmado no debug)
+    // viewers — padrão confirmado: "originalViewCount":"NNNN"
     const origViewM = html.match(/"originalViewCount":"(\d+)"/);
     if (origViewM && parseInt(origViewM[1]) > 0) {
-      result.viewers = parseInt(origViewM[1]);
-      result.live    = true;
+      result.viewers = parseInt(origViewM[1]); result.live = true;
     }
-
-    // padrão 2: originalViewCount escapado (\"originalViewCount\":\"3985\")
     if (!result.viewers) {
       const escM = html.match(/\\"originalViewCount\\":\\"(\d+)\\"/);
-      if (escM && parseInt(escM[1]) > 0) {
-        result.viewers = parseInt(escM[1]);
-        result.live    = true;
-      }
+      if (escM && parseInt(escM[1]) > 0) { result.viewers = parseInt(escM[1]); result.live = true; }
     }
-
-    // padrão 3: concurrentViewers
     if (!result.viewers) {
       const cvM = html.match(/"concurrentViewers":"(\d+)"/);
       if (cvM && parseInt(cvM[1]) > 0) { result.viewers = parseInt(cvM[1]); result.live = true; }
     }
-
-    // padrão 4: "3985 assistindo agora" ou "3.985 assistindo agora"
     if (!result.viewers) {
-      const watchM = html.match(/"([\d\.\,]+)\s*assistindo agora"/i);
+      const watchM = html.match(/([\d\.\,]+)\s*assistindo agora/i);
       if (watchM) { result.viewers = parseSubs(watchM[1]); result.live = true; }
     }
 
-    // padrão 5: escaped "3985 assistindo agora"
-    if (!result.viewers) {
-      const watchEsc = html.match(/([\d\.\,]+) assistindo agora/i);
-      if (watchEsc) { result.viewers = parseSubs(watchEsc[1]); result.live = true; }
-    }
-
-    // badge live
     if (!result.live) {
       result.live = html.includes('"BADGE_STYLE_TYPE_LIVE_NOW"')
         || html.includes('"isLive":true')
-        || html.includes('"style":"LIVE"');
+        || html.includes('"isLiveNow":true');
     }
 
-    // ytInitialData para videoId e título
-    const ytData = extractYtData(html);
-    if (ytData) {
-      const str = JSON.stringify(ytData);
-      if (!result.videoId) {
-        const vidM = str.match(/"currentVideoEndpoint":[^}]+?"videoId":"([a-zA-Z0-9_-]{11})"/);
-        if (vidM) result.videoId = vidM[1];
-      }
-      if (!result.title && result.live) {
+    // título
+    if (!result.title && result.live) {
+      const ytData = extractYtData(html);
+      if (ytData) {
+        const str = JSON.stringify(ytData);
         const titleM = str.match(/"videoPrimaryInfoRenderer":\{"title":\{"runs":\[\{"text":"([^"]+)"/);
         if (titleM) result.title = titleM[1];
       }
-    }
-
-    // último fallback — raw HTML
-    if (!result.live) {
-      result.live = html.includes('"isLiveNow":true')
-        || html.includes('"isLive":true')
-        || html.includes('isLiveContent":true');
     }
 
     if (!result.videoId && result.live) {
@@ -212,8 +192,34 @@ async function scrapeChannel(channelId) {
 
   } catch(e) { result.error_live = e.message; }
 
+  // ── 3. Busca lives adicionais na página /streams ──
+  result.extraLives = [];
+  try {
+    const r2   = await fetch(`https://www.youtube.com/channel/${channelId}/streams`, { headers: HEADERS });
+    const html2 = await r2.text();
+    const ytData2 = extractYtData(html2);
+    if (ytData2) {
+      const str = JSON.stringify(ytData2);
+      // extrai todos os videoIds de lives ativas (badge LIVE_NOW)
+      const liveBlocks = str.match(/"BADGE_STYLE_TYPE_LIVE_NOW"[\s\S]{0,300}?"videoId":"([a-zA-Z0-9_-]{11})"/g) || [];
+      for (const block of liveBlocks) {
+        const vidM = block.match(/"videoId":"([a-zA-Z0-9_-]{11})"/);
+        const titleM = block.match(/"text":"([^"]{5,100})"/);
+        if (vidM && vidM[1] !== result.videoId) {
+          result.extraLives.push({
+            videoId: vidM[1],
+            title: titleM ? titleM[1] : null,
+            thumb: `https://i.ytimg.com/vi/${vidM[1]}/maxresdefault_live.jpg`,
+            ytLink: `https://www.youtube.com/watch?v=${vidM[1]}`,
+          });
+        }
+      }
+    }
+  } catch {}
+
   if (result.videoId && result.live) {
-    result.thumb = `https://i.ytimg.com/vi/${result.videoId}/maxresdefault_live.jpg`;
+    result.thumb  = `https://i.ytimg.com/vi/${result.videoId}/maxresdefault_live.jpg`;
+    result.ytLink = `https://www.youtube.com/watch?v=${result.videoId}`;
   }
 
   setCache(channelId, result);
@@ -303,8 +309,20 @@ app.get('/debug/:channelId', async (req, res) => {
         viewCountSnippet: h2.match(/"viewCount":"[^"]+"/)?.[0] || null,
         watchingSnippet: h2.match(/.{0,30}assistindo agora.{0,50}/i)?.[0] || null,
         originalViewCount: h2.match(/.{0,10}originalViewCount.{0,50}/)?.[0] || null,
-        originalViewCountEsc: h2.match(/.{0,10}originalViewCount.{0,80}/)?.map(m=>m)?.[0] || null,
-      }
+      },
+      aboutPage: await (async () => {
+        try {
+          const r3 = await fetch(`https://www.youtube.com/channel/${channelId}/about`, { headers: HEADERS });
+          const h3 = await r3.text();
+          return {
+            length: h3.length,
+            hasSubs: h3.includes('subscriberCount'),
+            subsSnippet: h3.match(/subscriber[^"]{0,120}/i)?.[0] || null,
+            subsText: h3.match(/"subscriberCountText":.{0,150}/)?.[0] || null,
+            rawSubs: h3.match(/"subscriberCount":"[^"]+"/)?.[0] || null,
+          };
+        } catch(e) { return { error: e.message }; }
+      })(),
     });
   } catch(e) {
     res.status(500).json({ error: e.message });
