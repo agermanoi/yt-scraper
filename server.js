@@ -153,24 +153,41 @@ async function scrapeChannel(channelId) {
       }
     }
 
-    // extrai viewers e outros dados do HTML bruto
-    // padrão confirmado: "originalViewCount":"NNNN"
+    // ── viewers: busca no HTML bruto com múltiplos padrões ──
+    // O YouTube embute os dados em JSON escapado, então buscamos no texto bruto
+
+    // padrão 1: "originalViewCount":"3985" (confirmado no debug)
     const origViewM = html.match(/"originalViewCount":"(\d+)"/);
     if (origViewM && parseInt(origViewM[1]) > 0) {
       result.viewers = parseInt(origViewM[1]);
       result.live    = true;
     }
 
-    // fallback concurrent viewers
+    // padrão 2: originalViewCount escapado (\"originalViewCount\":\"3985\")
     if (!result.viewers) {
-      const cvM = html.match(/"concurrentViewers":"(\d+)"/);
-      if (cvM) { result.viewers = parseInt(cvM[1]); result.live = true; }
+      const escM = html.match(/\\"originalViewCount\\":\\"(\d+)\\"/);
+      if (escM && parseInt(escM[1]) > 0) {
+        result.viewers = parseInt(escM[1]);
+        result.live    = true;
+      }
     }
 
-    // "N assistindo agora"
+    // padrão 3: concurrentViewers
     if (!result.viewers) {
-      const watchM = html.match(/"([\d\.]+(?:mil|mi|k)?)\s*assistindo agora"/i);
+      const cvM = html.match(/"concurrentViewers":"(\d+)"/);
+      if (cvM && parseInt(cvM[1]) > 0) { result.viewers = parseInt(cvM[1]); result.live = true; }
+    }
+
+    // padrão 4: "3985 assistindo agora" ou "3.985 assistindo agora"
+    if (!result.viewers) {
+      const watchM = html.match(/"([\d\.\,]+)\s*assistindo agora"/i);
       if (watchM) { result.viewers = parseSubs(watchM[1]); result.live = true; }
+    }
+
+    // padrão 5: escaped "3985 assistindo agora"
+    if (!result.viewers) {
+      const watchEsc = html.match(/([\d\.\,]+) assistindo agora/i);
+      if (watchEsc) { result.viewers = parseSubs(watchEsc[1]); result.live = true; }
     }
 
     // badge live
@@ -297,7 +314,9 @@ app.get('/debug/:channelId', async (req, res) => {
         hasConcurrent: h2.includes('concurrentViewers'),
         concurrentSnippet: h2.match(/concurrentViewers.{0,100}/)?.[0] || null,
         viewCountSnippet: h2.match(/"viewCount":"[^"]+"/)?.[0] || null,
-        watchingSnippet: h2.match(/assistindo agora.{0,50}/i)?.[0] || null,
+        watchingSnippet: h2.match(/.{0,30}assistindo agora.{0,50}/i)?.[0] || null,
+        originalViewCount: h2.match(/.{0,10}originalViewCount.{0,50}/)?.[0] || null,
+        originalViewCountEsc: h2.match(/.{0,10}originalViewCount.{0,80}/)?.map(m=>m)?.[0] || null,
       }
     });
   } catch(e) {
